@@ -1,0 +1,1002 @@
+---
+title: "Zegveld Bayesian inference result analysis"
+author: "Alexander Buzacott"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(stringr)
+library(randomForest)
+library(data.table)
+library(BayesianTools)
+library(future.apply)
+library(DescTools)
+
+theme_set(theme_bw())
+
+annotation_custom <- function(grob,
+                              xmin = -Inf,
+                              xmax = Inf,
+                              ymin = -Inf,
+                              ymax = Inf,
+                              data) {
+  layer(data = data, stat = StatIdentity, position = PositionIdentity,
+        geom = ggplot2:::GeomCustomAnn,
+        inherit.aes = TRUE, params = list(grob = grob,
+                                          xmin = xmin, xmax = xmax,
+                                          ymin = ymin, ymax = ymax))
+}
+
+source("src/modelling_functions.R")
+```
+
+This notebook analyses the results of `zegveld_bayesian_fluxes.R` and generates
+the summary plots and statistics.
+
+## Load data
+
+```{r}
+df <- read_rds(file.path("output", "df.rds"))
+```
+
+## Years modelled
+
+```{r}
+years <- 2021:2022
+```
+
+## CO2 results
+
+### CO2 data
+
+```{r}
+co2_model_data <- read_rds(file.path("output", "co2_model_data.rds"))
+```
+
+### Read in results
+
+Read in posterior distributions for each year
+
+```{r}
+co2_post_dist <- vector("list", length(years))
+for (i in seq_along(years)) {
+  co2_r_fname <- file.path("output", paste0("co2_r", years[i], ".rds"))
+  co2_post_dist[[i]] <- read_rds(co2_r_fname)
+}
+names(co2_post_dist) <- years
+```
+
+### Plot posterior
+
+```{r}
+co2_post_dist_p_fname <- file.path("output", "co2_post_dist_p.rds")
+
+if (!file.exists(co2_post_dist_p_fname)) {
+  co2_post_dist_p <- lapply(co2_post_dist, function(x) {
+    as_tibble(getSample(x))
+  })
+  co2_post_dist_p <- bind_rows(co2_post_dist_p, .id = "year") %>%
+    select(-contains("nee")) %>%
+    pivot_longer(-year) %>%
+    mutate(type = stringr::str_split_fixed(name, "_", 2)[, 1],
+           type = factor(type,
+                         levels = c("pt", "rf"),
+                         labels = c("Typha", "Ref")),
+           param = stringr::str_split_fixed(name, "_", 2)[, 2],
+           src = if_else(param %in% c("e_0", "r_ref"), "Reco", "GPP"),
+           param = factor(param,
+                          levels = c("e_0",
+                                     "r_ref",
+                                     "alpha",
+                                     "beta",
+                                     "alpha_amplitude",
+                                     "beta_amplitude",
+                                     "phase_shift"),
+                          labels = c("E[0]",
+                                     "R[Ref]",
+                                     "alpha",
+                                     "beta",
+                                     "A[alpha]",
+                                     "A[beta]",
+                                     "phi")))
+  write_rds(co2_post_dist_p, co2_post_dist_p_fname, compress = "gz")
+} else {
+  co2_post_dist_p <- read_rds(co2_post_dist_p_fname)
+}
+```
+
+```{r}
+p <- co2_post_dist_p %>%
+  ggplot(aes(value, col = type, linetype = year)) +
+  geom_density() +
+  scale_linetype_manual(values = c("2020" = 1, "2021" = 2, "2022" = 3)) +
+  facet_wrap(~src + param,
+             scales = "free",
+             labeller = label_parsed,
+             ncol = 5,
+             nrow = 2) +
+  labs(x = NULL,
+       y = "Density",
+       col = "Source",
+       linetype = "Year") +
+  scale_colour_manual(values = c("Typha" = scales::hue_pal()(3)[1],
+                                 "Ref" = scales::hue_pal()(3)[2]))
+
+# To be added later
+inset <- co2_post_dist_p %>%
+  filter(param == "A[beta]") %>%
+  ggplot(aes(value, col = type, linetype = year)) +
+  geom_density() +
+  coord_cartesian(ylim = c(0, 0.5)) +
+  guides(col = "none", linetype = "none") +
+  labs(x = NULL, y = NULL) +
+  theme(plot.background = element_rect(colour = "black", linewidth = 0.5)) +
+  scale_colour_manual(values = c("Typha" = scales::hue_pal()(3)[1],
+                                 "Ref" = scales::hue_pal()(3)[2])) +
+  scale_linetype_manual(values = c("2020" = 1, "2021" = 2, "2022" = 3))
+
+p <- p +
+  annotation_custom(ggplotGrob(inset),
+                    data = co2_post_dist_p %>% filter(param == "A[beta]"),
+                    xmin = 2.5, xmax = 29,
+                    ymin = 0.75, ymax = 9)
+
+ggsave(file.path("figures", "co2_post_dist.png"),
+       p,
+       dpi = 300,
+       width = 15,
+       height = 6)
+```
+
+### Simulate timeseries
+
+```{r}
+# Full timeseries with no missing data
+co2_eval_data <- df %>%
+  select(datetime,
+         year,
+         doy,
+         TS_PT,
+         TS_RF,
+         Rg = PPFD_IN_F,
+         NEE,
+         Contribution_GF) %>%
+  as.data.table()
+
+# Function to evaluate parameter sets
+co2_model_ts <- function(params, data) {
+  # Subset data
+  data <- data[year == params[1]]
+
+  pt_r_ref <- params[2]
+  pt_e_0 <- params[3]
+  pt_alpha <- params[4]
+  pt_beta <- params[5]
+  pt_alpha_amplitude <- params[6]
+  pt_beta_amplitude <- params[7]
+  pt_phase_shift <- params[8]
+  rf_r_ref <- params[9]
+  rf_e_0 <- params[10]
+  rf_alpha <- params[11]
+  rf_beta <- params[12]
+  rf_alpha_amplitude <- params[13]
+  rf_beta_amplitude <- params[14]
+  rf_phase_shift <- params[15]
+
+  pt_reco <- respiration_lloyd_taylor(pt_r_ref, pt_e_0, data$TS_PT)
+  pt_gpp <- gpp_sin(
+    alpha = pt_alpha,
+    beta = pt_beta,
+    Rg = data$Rg,
+    doy = data$doy,
+    phase_shift = pt_phase_shift,
+    alpha_amplitude = pt_alpha_amplitude,
+    beta_amplitude = pt_beta_amplitude
+  )
+  pt_nee <- pt_gpp + pt_reco
+
+  rf_reco <- respiration_lloyd_taylor(rf_r_ref, rf_e_0, data$TS_RF)
+  rf_gpp <- gpp_sin(
+    alpha = rf_alpha,
+    beta = rf_beta,
+    Rg = data$Rg,
+    doy = data$doy,
+    phase_shift = rf_phase_shift,
+    alpha_amplitude = rf_alpha_amplitude,
+    beta_amplitude = rf_beta_amplitude
+  )
+  rf_nee <- rf_gpp + rf_reco
+
+  nee_sim <- pt_nee * data$Contribution_GF + rf_nee * (1 - data$Contribution_GF)
+
+  dt <- data.table(datetime = data$datetime,
+                   pt_reco = pt_reco,
+                   pt_gpp = pt_gpp,
+                   pt_nee = pt_nee,
+                   rf_reco = rf_reco,
+                   rf_gpp = rf_gpp,
+                   rf_nee = rf_nee,
+                   NEE_sim = nee_sim)
+  return(dt)
+}
+```
+
+### Model performance statistics
+
+```{r}
+co2_params_full <- lapply(co2_post_dist, function(x) {
+  as.data.table(getSample(x))
+}) %>%
+  bind_rows(.id = "year") %>%
+  mutate(year = as.numeric(year))
+
+# Function to return stats from each simulation
+co2_stats_f <- function(params, data) {
+  ts <- co2_model_ts(params, data)
+
+  obs <- data[year == params[[1]]]$NEE
+  sim <- ts$NEE_sim
+
+  perf <- c(
+    year = params[[1]],
+    RMSE = RMSE(obs, sim),
+    `R$^2$` = cor(obs, sim)^2,
+    LCCC = CCC(obs, sim)$rho.c$est,
+    Bias = mean(obs - sim)
+  )
+
+  return(perf)
+}
+```
+
+```{r}
+co2_sim_stats_fname <- file.path("output", "co2_sim_stats.rds")
+
+if (!file.exists(co2_sim_stats_fname)) {
+  plan(multisession, workers = 7)
+  co2_sim_stats <- future_apply(co2_params_full,
+                                MARGIN = 1,
+                                co2_stats_f,
+                                data = co2_eval_data %>% filter(is.finite(NEE)))
+  plan(sequential)
+  write_rds(co2_sim_stats, co2_sim_stats_fname, compress = "gz")
+} else {
+  co2_sim_stats <- read_rds(co2_sim_stats_fname)
+}
+
+co2_sim_stats <- as_tibble(t(co2_sim_stats))
+```
+
+Write a summary csv
+
+```{r}
+co2_sim_stats_summary_fname <- file.path("results", "co2_sim_stats_summary.csv")
+
+if (!file.exists(co2_sim_stats_summary_fname)) {
+  co2_sim_stats_summary <- co2_sim_stats %>%
+    pivot_longer(c(RMSE, `R$^2$`, LCCC, Bias)) %>%
+    group_by(name) %>%
+    summarise(min = min(value),
+              q02.5 = quantile(value, 0.025),
+              q05 = quantile(value, 0.05),
+              q25 = quantile(value, 0.25),
+              mean = mean(value),
+              median = median(value),
+              q75 = quantile(value, 0.75),
+              q95 = quantile(value, 0.95),
+              q97.5 = quantile(value, 0.975),
+              max = max(value),
+              sd = sd(value)) %>%
+    pivot_longer(-name, names_to = "stat") %>%
+    pivot_wider()
+
+  write_csv(co2_sim_stats_summary, co2_sim_stats_summary_fname)
+} else {
+  co2_sim_stats_summary <- read_csv(co2_sim_stats_summary_fname)
+}
+
+co2_sim_stats_summary %>%
+  mutate(across(where(is.numeric), ~round(.x, 2))) %>%
+  knitr::kable()
+```
+
+### Model performance objects
+
+```{r}
+co2_sim_fname <- file.path("output", "co2_sim.rds")
+co2_sim_day_fname <- file.path("output", "co2_sim_day.rds")
+co2_obs_sim_fname <- file.path("output", "co2_obs_sim.rds")
+
+if (!file.exists(co2_sim_fname)) {
+  # Take sample of 3000 sets for plotting
+  co2_params_sample <- lapply(co2_post_dist, function(x) {
+    as.data.table(getSample(x, numSamples = 3000))
+  })
+  co2_params_sample <- bind_rows(co2_params_sample, .id = "year") %>%
+    mutate(year = as.numeric(year))
+
+  plan(multisession, workers = 7)
+  co2_sim <- future_apply(co2_params_sample,
+                          MARGIN = 1,
+                          co2_model_ts,
+                          data = co2_eval_data)
+  plan(sequential)
+
+  write_rds(co2_sim, co2_sim_fname, compress = "gz")
+} else {
+  co2_sim <- read_rds(co2_sim_fname)
+}
+
+if (!file.exists(co2_sim_day_fname)) {
+  co2_sim_day <- lapply(co2_sim, function(x) {
+    x$datetime <- as_date(x$datetime - 1)
+    x <- x[, lapply(.SD, mean), by = datetime]
+    x[, 2:ncol(x)] <- x[, 2:ncol(x)] * 44 * 10^-9 * 10^4 * 86400 # µmol/m2/s -> t CO2/ha/day
+    return(x)
+  }) %>%
+    bind_rows(.id = "Sim")
+  write_rds(co2_sim_day, co2_sim_day_fname, compress = "gz")
+} else {
+  co2_sim_day <- read_rds(co2_sim_day_fname)
+}
+
+if (!file.exists(co2_obs_sim_fname)) {
+  co2_obs_sim_summary <- rbindlist(co2_sim) %>%
+    filter(datetime %in% co2_model_data$datetime) %>%
+    group_by(datetime) %>%
+    summarise(
+    min = min(NEE_sim),
+    q02.5 = quantile(NEE_sim, 0.025),
+    q25 = quantile(NEE_sim, 0.25),
+    mean = mean(NEE_sim),
+    median = median(NEE_sim),
+    q75 = quantile(NEE_sim, 0.75),
+    q97.5 = quantile(NEE_sim, 0.975),
+    max = max(NEE_sim)
+  ) %>%
+  left_join(df %>% select(datetime, night, Obs = NEE))
+  write_rds(co2_obs_sim_summary, co2_obs_sim_fname, compress = "gz")
+} else {
+  co2_obs_sim_summary <- read_rds(co2_obs_sim_fname)
+}
+```
+
+### Plot of performance
+
+```{r}
+p1 <- ggplot(co2_obs_sim_summary) +
+  geom_point(aes(Obs, mean), size = 0.5) +
+  geom_abline(col = "red") +
+  labs(x = expression(Obs~NEE~"["*µmol~m^{-2}~s^{-1}*"]"),
+       y = expression(Sim~NEE~"["*µmol~m^{-2}~s^{-1}*"]")) +
+  scale_y_continuous(limits = c(-30, 30),
+                     breaks = seq(-30, 30, 10)) +
+  scale_x_continuous(limits = c(-30, 30),
+                     breaks = seq(-30, 30, 10))
+
+p2 <- co2_obs_sim_summary %>%
+  filter(night) %>%
+  ggplot() +
+  geom_point(aes(Obs, mean), size = 0.5) +
+  geom_abline(col = "red") +
+  labs(x = expression(Obs~night~NEE~"["*µmol~m^{-2}~s^{-1}*"]"),
+       y = expression(Sim~night~NEE~"["*µmol~m^{-2}~s^{-1}*"]")) +
+  ylim(0, NA)
+
+p3 <- co2_obs_sim_summary %>%
+  filter(!night) %>%
+  ggplot() +
+  geom_point(aes(Obs, mean), size = 0.5) +
+  geom_abline(col = "red") +
+  labs(x = expression(Obs~day~NEE~"["*µmol~m^{-2}~s^{-1}*"]"),
+       y = expression(Sim~day~NEE~"["*µmol~m^{-2}~s^{-1}*"]")) +
+  scale_y_continuous(limits = c(-30, 30),
+                     breaks = seq(-30, 30, 10)) +
+  scale_x_continuous(limits = c(-30, 30),
+                     breaks = seq(-30, 30, 10))
+p <- egg::ggarrange(p1, p2, p3, nrow = 1)
+
+ggsave(file.path("figures", "co2_obs_sim.png"),
+       p,
+       dpi = 300,
+       width = 9,
+       height = 3)
+```
+
+### Model sim timeseries
+
+```{r}
+co2_sim_summary_day <- co2_sim_day %>%
+  select(Sim, date = datetime, pt_nee, rf_nee, NEE_sim) %>%
+  pivot_longer(-c(date, Sim)) %>%
+  mutate(name = factor(name,
+                       levels = c("pt_nee", "rf_nee", "NEE_sim"),
+                       labels = c("Typha", "Ref", "NEE_sim"))) %>%
+  group_by(date, name) %>%
+  summarise(
+    min = mean(value),
+    q02.5 = quantile(value, 0.025, na.rm = TRUE),
+    q05 = quantile(value, 0.05, na.rm = TRUE),
+    q25 = quantile(value, 0.25, na.rm = TRUE),
+    mean = mean(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    q75 = quantile(value, 0.75, na.rm = TRUE),
+    q95 = quantile(value, 0.95, na.rm = TRUE),
+    q97.5 = quantile(value, 0.975, na.rm = TRUE),
+    max = mean(value),
+    sd = max(value),
+    .groups = "drop"
+  ) %>%
+  mutate(year = year(date),
+         doy = yday(date))
+
+write_rds(co2_sim_summary_day,
+          file.path("output", "co2_sim_summary_day.rds"), compress = "gz")
+```
+
+```{r}
+# CO2 daily observed data
+co2_obs_day <- df %>%
+  mutate(date = as_date(datetime - 1)) %>%
+  select(date, night, NEE, NEE_GF = NEE_F_MDS) %>%
+  group_by(date) %>%
+  summarise(n = sum(!is.na(NEE)),
+            n_night = sum(night & !is.na(NEE)),
+            n_day = n - n_night,
+            n_night_hours = sum(night),
+            n_day_hours = sum(!night),
+            mean = mean(NEE, na.rm = TRUE),
+            mean_day = mean(NEE[!night], na.rm = TRUE),
+            mean_night = mean(NEE[night], na.rm = TRUE),
+            mean2 = mean_day + mean_night,
+            mean_gf = mean(NEE_GF, na.rm = TRUE),
+            .groups = "drop") %>%
+  # filter(n > 24) %>%
+  mutate(across(c(mean, mean_gf, mean2),
+                ~.x * 44 * 10^-6 * 10^-3 * 10^4 * 86400)) %>%
+  mutate(year = year(date),
+         year_gr = year(date %m-% months(2)),
+         doy = yday(date))
+
+write_rds(co2_obs_day, file.path("output", "co2_obs_day.rds"), compress = "gz")
+```
+
+#### Plot
+
+```{r}
+ggplot(co2_sim_summary_day) +
+  geom_point(data = co2_obs_day, aes(doy, mean_gf, fill = "Obs"), size = 0.5) +
+  geom_ribbon(aes(x = doy, ymin = q02.5, ymax = q97.5, col = name), alpha = 0.5, show.legend = FALSE, linewidth = 0.5) +
+  geom_line(aes(doy, median, col = name)) +
+  facet_wrap(~year, ncol = 1) +
+  labs(x = "Day of the year",
+       col = NULL,
+       fill = NULL,
+       y = expression(NEE~"["*kg~ha^{-1}*~d^{-1}*"]")) +
+  scale_colour_discrete(labels = c("Typha", "Ref", expression(NEE~Sim))) +
+  scale_fill_manual(values = c("Obs" = 1), label = expression(NEE)) +
+  theme(legend.text.align = 0)
+```
+
+### Budget
+
+Use all simulations for the budget
+
+```{r}
+co2_budget_f <- function(params, data) {
+  ts <- co2_model_ts(params, data)
+  ys <- 44 * 10^-8 * 1800 # µmol/m2/s -> kg CO2/ha/1800 for summing
+
+  dt <- c(year = params[[1]],
+          pt_reco = sum(ts$pt_reco) * ys,
+          pt_gpp = sum(ts$pt_gpp) * ys,
+          pt_nee = sum(ts$pt_nee) * ys,
+          rf_reco = sum(ts$rf_reco) * ys,
+          rf_gpp = sum(ts$rf_gpp) * ys,
+          rf_nee = sum(ts$rf_nee) * ys,
+          NEE_sim = sum(ts$NEE_sim) * ys)
+
+  return(dt)
+}
+```
+
+```{r}
+co2_sim_budget_fname <- file.path("output", "co2_sim_budget.rds")
+
+if (!file.exists(co2_sim_budget_fname)) {
+  plan(multisession, workers = 7)
+  co2_sim_budget <- future_apply(co2_params_full,
+                                 MARGIN = 1,
+                                 co2_budget_f,
+                                 data = co2_eval_data)
+  plan(sequential)
+
+  co2_sim_budget <- as_tibble(t(co2_sim_budget)) %>%
+    pivot_longer(-year) %>%
+    group_by(year, name) %>%
+    summarise(min = min(value),
+              q02.5 = quantile(value, 0.025),
+              q05 = quantile(value, 0.05),
+              q25 = quantile(value, 0.25),
+              mean = mean(value),
+              sd = sd(value),
+              q75 = quantile(value, 0.75),
+              q95 = quantile(value, 0.95),
+              q97.5 = quantile(value, 0.975),
+              max = max(value),
+              .groups = "drop") %>%
+    pivot_longer(-c(year, name), names_to = "stat") %>%
+    pivot_wider()
+
+  write_rds(co2_sim_budget, co2_sim_budget_fname)
+} else {
+  co2_sim_budget <- read_rds(co2_sim_budget_fname)
+}
+```
+
+```{r}
+co2_sim_budget %>%
+  mutate(across(-c(year, stat), ~round(.x, 1))) %>%
+  knitr::kable()
+```
+
+### Reco/GPP Timeseries
+
+```{r}
+co2_fp_summary_day <- co2_sim_day %>%
+  select(date = datetime, pt_reco, pt_gpp, rf_gpp, rf_reco) %>%
+  pivot_longer(-date) %>%
+  group_by(date, name) %>%
+  summarise(
+    min = mean(value),
+    q02.5 = quantile(value, 0.025, na.rm = TRUE),
+    q05 = quantile(value, 0.05, na.rm = TRUE),
+    q25 = quantile(value, 0.25, na.rm = TRUE),
+    mean = mean(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    q75 = quantile(value, 0.75, na.rm = TRUE),
+    q95 = quantile(value, 0.95, na.rm = TRUE),
+    q97.5 = quantile(value, 0.975, na.rm = TRUE),
+    max = mean(value),
+    sd = max(value),
+    .groups = "drop"
+  ) %>%
+  mutate(year = year(date),
+         doy = yday(date)) %>%
+  mutate(src = str_sub(name, 1, 2),
+         name = str_sub(name, 4, 7))
+```
+
+```{r}
+ggplot(co2_fp_summary_day, aes(date, mean, col = src)) +
+  geom_ribbon(aes(date, ymin = q02.5, ymax = q97.5)) +
+  geom_line() +
+  facet_wrap(~name, ncol = 1)
+```
+
+## CH4 results
+
+### CH4 data
+
+```{r}
+ch4_model_data <- read_rds(file.path("output", "ch4_model_data.rds"))
+```
+
+### Read in results
+
+```{r}
+ch4_post_dist <- vector("list", length(years))
+for (i in seq_along(years)) {
+  ch4_r_fname <- file.path("output", paste0("ch4_r", years[i], ".rds"))
+  ch4_post_dist[[i]] <- read_rds(ch4_r_fname)
+}
+names(ch4_post_dist) <- years
+```
+
+### Plot posterior
+
+```{r}
+ch4_post_dist_p_fname <- file.path("output", "ch4_post_dist_p.rds")
+if (!file.exists(ch4_post_dist_p_fname)) {
+  ch4_post_dist_p <- lapply(ch4_post_dist, function(x) {
+    as_tibble(getSample(x))
+  })
+  ch4_post_dist_p <- bind_rows(ch4_post_dist_p, .id = "year") %>%
+    select(-contains("err")) %>%
+    pivot_longer(-year) %>%
+    mutate(type = stringr::str_split_fixed(name, "_", 2)[, 1],
+           type = factor(type,
+                         levels = c("pt", "rf"),
+                         labels = c("Typha", "Ref")),
+           param = stringr::str_split_fixed(name, "_", 2)[, 2],
+           param = factor(param,
+                          levels = c("a", "b", "k")))
+  write_rds(ch4_post_dist_p, ch4_post_dist_p_fname, compress = "gz")
+} else {
+  ch4_post_dist_p <- read_rds(ch4_post_dist_p_fname)
+}
+```
+
+```{r}
+p <- ch4_post_dist_p %>%
+  drop_na() %>%
+  ggplot(aes(value, col = type, linetype = year)) +
+  geom_density() +
+  scale_linetype_manual(values = c("2021" = 2, "2022" = 3)) +
+  facet_wrap(~param,
+             scales = "free",
+             labeller = label_parsed,
+             ncol = 5,
+             nrow = 2) +
+  labs(x = NULL,
+       y = "Density",
+       col = "Source",
+       linetype = "Year") +
+  scale_colour_manual(values = c("Typha" = scales::hue_pal()(3)[1],
+                                 "Ref" = scales::hue_pal()(3)[2]))
+
+ggsave(file.path("figures", "ch4_post_dist.png"),
+       p,
+       dpi = 300,
+       width = 10,
+       height = 3)
+```
+
+### Simulate timeseries
+
+```{r}
+ch4_eval_data <- df %>%
+  select(datetime,
+         year,
+         season,
+         night,
+         doy,
+         night,
+         Contribution_GF,
+         FCH4,
+         TS_PT,
+         TS_RF,
+         WL_PT,
+         WL_RF) %>%
+  as.data.table()
+
+ch4_model_ts <- function(params, data) {
+  data <- data[year == params[1]]
+  pt_pred <- fch4_temp_wl(data$TS_PT, data$WL_PT,
+                          params[2], params[3], params[4])
+  rf_pred <- fch4_temp_wl(data$TS_RF, data$WL_RF,
+                          params[5], params[6], params[7])
+
+  nee_ch4_pred <- pt_pred * data$Contribution_GF +
+    rf_pred * (1 - data$Contribution_GF)
+
+  dt <- data.table(datetime = data$datetime,
+                   pt_fch4 = pt_pred,
+                   rf_fch4 = rf_pred,
+                   FCH4_sim = nee_ch4_pred)
+
+  return(dt)
+}
+```
+
+### Model performance statistics
+
+```{r}
+ch4_params_full <- lapply(ch4_post_dist, function(x) {
+  as.data.table(getSample(x))
+}) %>%
+  bind_rows(.id = "year") %>%
+  mutate(year = as.numeric(year))
+
+# Function to return stats from each simulation
+ch4_stats_f <- function(params, data) {
+  ts <- ch4_model_ts(params, data)
+
+  obs <- data[year == params[[1]]]$FCH4
+  sim <- ts$FCH4_sim
+
+  perf <- c(
+    year = params[[1]],
+    RMSE = RMSE(obs, sim),
+    `R$^2$` = cor(obs, sim)^2,
+    LCCC = CCC(obs, sim)$rho.c$est,
+    Bias = mean(obs - sim)
+  )
+
+  return(perf)
+}
+```
+
+```{r}
+ch4_sim_stats_fname <- file.path("output", "ch4_sim_stats.rds")
+
+if (!file.exists(ch4_sim_stats_fname)) {
+  plan(multisession, workers = 7)
+  ch4_sim_stats <- future_apply(ch4_params_full,
+                                MARGIN = 1,
+                                ch4_stats_f,
+                                data = filter(ch4_eval_data, is.finite(FCH4)))
+  plan(sequential)
+  write_rds(ch4_sim_stats, ch4_sim_stats_fname, compress = "gz")
+} else {
+  ch4_sim_stats <- read_rds(ch4_sim_stats_fname)
+}
+
+ch4_sim_stats <- as_tibble(t(ch4_sim_stats))
+```
+
+Write a summary csv
+
+```{r}
+ch4_sim_stats_summary_fname <- file.path("results", "ch4_sim_stats_summary.csv")
+
+if (!file.exists(ch4_sim_stats_summary_fname)) {
+  ch4_sim_stats_summary <- ch4_sim_stats %>%
+    pivot_longer(c(RMSE, `R$^2$`, LCCC, Bias)) %>%
+    group_by(name) %>%
+    summarise(min = min(value),
+              q05 = quantile(value, 0.05),
+              q02.5 = quantile(value, 0.025),
+              q25 = quantile(value, 0.25),
+              mean = mean(value),
+              median = median(value),
+              q75 = quantile(value, 0.75),
+              q95 = quantile(value, 0.95),
+              q97.5 = quantile(value, 0.975),
+              max = max(value),
+              sd = sd(value)) %>%
+    pivot_longer(-name, names_to = "stat") %>%
+    pivot_wider()
+
+  write_csv(ch4_sim_stats_summary, ch4_sim_stats_summary_fname)
+} else {
+  ch4_sim_stats_summary <- read_csv(ch4_sim_stats_summary_fname)
+}
+
+ch4_sim_stats_summary %>%
+  mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+  knitr::kable()
+```
+
+### Model performance objects
+
+```{r}
+ch4_sim_fname <- file.path("output", "ch4_sim.rds")
+ch4_sim_day_fname <- file.path("output", "ch4_sim_day.rds")
+ch4_obs_sim_fname <- file.path("output", "ch4_obs_sim.rds")
+
+if (!file.exists(ch4_sim_day_fname) & !file.exists(ch4_obs_sim_fname)) {
+  if (!file.exists(ch4_sim_fname)) {
+    ch4_params <- lapply(ch4_post_dist, function(x) {
+      as.data.table(getSample(x, numSamples = 3000))
+    })
+    ch4_params <- bind_rows(ch4_params, .id = "year") %>%
+      mutate(year = as.numeric(year))
+
+    ch4_sim <- apply(ch4_params, MARGIN = 1, ch4_model_ts, data = ch4_eval_data)
+
+    write_rds(ch4_sim, ch4_sim_fname, compress = "gz")
+  } else {
+    ch4_sim <- read_rds(ch4_sim_fname)
+  }
+}
+
+if (!file.exists(ch4_sim_day_fname)) {
+  ch4_sim_day <- lapply(ch4_sim, function(x) {
+    x$datetime <- as_date(x$datetime - 1)
+    x <- x[, lapply(.SD, mean), by = datetime]
+    x[, 2:ncol(x)] <- x[, 2:ncol(x)] * 16 * 10^-9 * 10^4 * 86400 # umol/m2/s -> kg/ha/day
+    return(x)
+  }) %>%
+    bind_rows(.id = "Sim")
+  write_rds(ch4_sim_day, ch4_sim_day_fname, compress = "gz")
+} else {
+  ch4_sim_day <- read_rds(ch4_sim_day_fname)
+}
+
+if (!file.exists(ch4_obs_sim_fname)) {
+  ch4_obs_sim_summary <- rbindlist(ch4_sim) %>%
+    filter(datetime %in% ch4_model_data$datetime) %>%
+    group_by(datetime) %>%
+    summarise(
+      min = min(FCH4_sim),
+      q02.5 = quantile(FCH4_sim, 0.025),
+      q25 = quantile(FCH4_sim, 0.25),
+      mean = mean(FCH4_sim),
+      median = median(FCH4_sim),
+      q75 = quantile(FCH4_sim, 0.75),
+      q97.5 = quantile(FCH4_sim, 0.975),
+      max = max(FCH4_sim),
+      sd = sd(FCH4_sim)
+    ) %>%
+    left_join(df %>% select(datetime, night, Obs = FCH4))
+  write_rds(ch4_obs_sim_summary, ch4_obs_sim_fname, compress = "gz")
+} else {
+  ch4_obs_sim_summary <- read_rds(ch4_obs_sim_fname)
+}
+```
+
+### Plot of performance
+
+```{r}
+p1 <- ggplot(ch4_obs_sim_summary) +
+  geom_point(aes(Obs, mean), size = 0.5) +
+  geom_abline(col = "red") +
+  labs(x = expression(Obs~FCH[4]~"["*µmol~m^{-2}~s^{-1}*"]"),
+       y = expression(Sim~FCH[4]~"["*µmol~m^{-2}~s^{-1}*"]")) +
+  ylim(0, 0.5) +
+  xlim(0, 0.5)
+
+ggsave(file.path("figures", "ch4_obs_sim.png"),
+       p1,
+       dpi = 300,
+       width = 3,
+       height = 3)
+```
+
+### Model sim timeseries
+
+```{r}
+ch4_sim_summary_day <- ch4_sim_day %>%
+  select(Sim, date = datetime, pt_fch4, rf_fch4, FCH4_sim) %>%
+  pivot_longer(-c(date, Sim)) %>%
+  mutate(name = factor(name,
+                       levels = c("pt_fch4", "rf_fch4", "FCH4_sim"),
+                       labels = c("Typha", "Ref", "FCH4_sim"))) %>%
+  group_by(date, name) %>%
+  summarise(n = n(),
+            min = min(value, na.rm = TRUE),
+            q01 = quantile(value, 0.01, na.rm = TRUE),
+            q02.5 = quantile(value, 0.025, na.rm = TRUE),
+            q05 = quantile(value, 0.05, na.rm = TRUE),
+            q25 = quantile(value, 0.25, na.rm = TRUE),
+            mean = mean(value, na.rm = TRUE),
+            median = median(value, na.rm = TRUE),
+            q75 = quantile(value, 0.75, na.rm = TRUE),
+            q95 = quantile(value, 0.95, na.rm = TRUE),
+            q97.5 = quantile(value, 0.975, na.rm = TRUE),
+            q99 = quantile(value, 0.99, na.rm = TRUE),
+            max = max(value, na.rm = TRUE),
+            sd = sd(value, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(year = year(date),
+         doy = yday(date))
+
+write_rds(ch4_sim_summary_day,
+          file.path("output", "ch4_sim_summary_day.rds"),
+          compress = "gz")
+```
+
+```{r}
+# Daily aggregate of ch4 observations
+ch4_obs_day <- df %>%
+  mutate(date = as_date(datetime - 1)) %>%
+  select(date, FCH4, FCH4_F_MDS) %>%
+  drop_na() %>%
+  group_by(date) %>%
+  summarise(min = min(FCH4),
+            sd = sd(FCH4),
+            mean = mean(FCH4),
+            median = median(FCH4),
+            max = max(FCH4),
+            mean_mds = mean(FCH4_F_MDS),
+            .groups = "drop") %>%
+  mutate(across(where(is.numeric),
+                ~.x * 16 * 10^-6 * 10^-3 * 10^4 * 86400)) %>% # µmol/m2/s to t CO2-eq/ha/day
+  mutate(year = year(date),
+         year_gr = year(date %m-% months(2)),
+         doy = yday(date))
+
+write_rds(ch4_obs_day,
+          file.path("output", "ch4_obs_day.rds"),
+          compress = "gz")
+```
+
+#### Plot
+
+```{r}
+ch4_sim_summary_day %>%
+  ggplot() +
+  geom_point(data = ch4_obs_day, aes(doy, mean_mds, fill = "Obs"),
+             size = 0.5) +
+  geom_ribbon(aes(x = doy, ymin = q02.5, ymax = q97.5, col = name),
+              alpha = 0.5,
+              show.legend = FALSE,
+              linewidth = 0.5) +
+  geom_line(aes(doy, median, col = name)) +
+  facet_wrap(~year, ncol = 1) +
+  labs(x = "Day of the year",
+       col = NULL,
+       fill = NULL,
+       y = expression(FCH[4]~"["*kg~ha^{-1}*~d^{-1}*"]")) +
+  # guides(fill = FALSE) +
+  scale_colour_discrete(labels = c("Typha", "Ref", expression(FCH[4]~Sim))) +
+  scale_fill_manual(values = c("Obs" = 1), label = expression(FCH[4])) +
+  theme(legend.text.align = 0) +
+  ylim(-0.5, 6)
+
+ggsave(file.path("figures", "ch4_modelled_ts.png"),
+       dpi = 300,
+       height = 6,
+       width = 8)
+```
+
+### Budget
+
+```{r}
+ch4_budget_f <- function(params, data) {
+
+  ts <- ch4_model_ts(params, data)
+  ys <- 16 * 10^-5 * 1800 # µmol/m2/s -> kg CH4/ha/30 min for summing
+
+  dt <- c(year = params[[1]],
+          pt_fch4 = sum(ts$pt_fch4) * ys,
+          rf_fch4 = sum(ts$rf_fch4) * ys,
+          FCH4_sim = sum(ts$FCH4_sim) * ys)
+
+  return(dt)
+}
+```
+
+```{r}
+ch4_sim_budget_fname <- file.path("output", "ch4_sim_budget.rds")
+
+if (!file.exists(ch4_sim_budget_fname)) {
+  ch4_params_full <- lapply(ch4_post_dist, function(x) {
+    as.data.table(getSample(x))
+  }) %>%
+    bind_rows(.id = "year") %>%
+    mutate(year = as.numeric(year))
+
+  plan(multisession, workers = 7)
+  ch4_sim_budget <- future_apply(ch4_params_full,
+                                 MARGIN = 1,
+                                 ch4_budget_f,
+                                 data = ch4_eval_data)
+  plan(sequential)
+
+  ch4_sim_budget <- as_tibble(t(ch4_sim_budget)) %>%
+    pivot_longer(-year) %>%
+    group_by(year, name) %>%
+    summarise(
+      min = min(value),
+      q02.5 = quantile(value, 0.025),
+      q05 = quantile(value, 0.05),
+      q25 = quantile(value, 0.25),
+      mean = mean(value),
+      sd = sd(value),
+      q75 = quantile(value, 0.75),
+      q95 = quantile(value, 0.95),
+      q97.5 = quantile(value, 0.975),
+      max = max(value),
+      .groups = "drop"
+    ) %>%
+    pivot_longer(-c(year, name), names_to = "stat") %>%
+    pivot_wider()
+
+  write_rds(ch4_sim_budget, ch4_sim_budget_fname)
+} else {
+  ch4_sim_budget <- read_rds(ch4_sim_budget_fname)
+}
+```
+
+```{r}
+ch4_sim_budget %>%
+  mutate(across(-c(year, stat), ~round(.x, 1))) %>%
+  knitr::kable()
+```
+
+```{r}
+ch4_sim_budget %>%
+  mutate(across(-c(year, stat), ~round(.x * 27 / 1000, 1))) %>%
+  knitr::kable()
+```
